@@ -5,7 +5,7 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import nodemailer from 'nodemailer';
+
 
 import { db } from './db.js';
 import { advise } from './chatbot.js';
@@ -22,7 +22,6 @@ const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
 const SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 
-const DEV = process.env.NODE_ENV !== 'production';
 
 const STAT = [
   'Chờ xác nhận',
@@ -110,19 +109,21 @@ const tags = product => ({
 });
 
 
-// =========================================
-// 3. OTP - GỬI EMAIL BẰNG GMAIL SMTP
-// =========================================
+
+
+
+/* =========================================
+   3. OTP - CHẾ ĐỘ DEMO, KHÔNG GỬI EMAIL
+========================================= */
 
 async function sendOtp(user) {
-  // Tạo mã OTP 6 chữ số
-  const otp = String(
-    crypto.randomInt(100000, 1000000)
-  );
+  // Tạo mã OTP ngẫu nhiên gồm 6 chữ số
+  const otp = String(crypto.randomInt(100000, 1000000));
 
-  // Mã hóa OTP trước khi lưu vào database
+  // Mã hóa OTP trước khi lưu vào Database
   const hashedOtp = await bcrypt.hash(otp, 8);
 
+  // Lưu OTP và thời gian hết hạn 5 phút
   await db.query(
     `UPDATE users
      SET otp = ?,
@@ -131,56 +132,19 @@ async function sendOtp(user) {
     [hashedOtp, user.id]
   );
 
-  // Kiểm tra cấu hình Gmail
-  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    throw new Error('Chưa cấu hình SMTP_USER hoặc SMTP_PASS trong file .env');
-  }
+  // Hiển thị OTP trong log Backend
+  console.log('[OTP DEMO]', user.email, otp);
 
-  // Tạo kết nối Gmail SMTP
-  const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
-    }
-  });
-
-  try {
-    // Gửi email OTP
-    await transporter.sendMail({
-      from: `"BeautyGlow AI" <${process.env.SMTP_USER}>`,
-      to: user.email,
-      subject: 'Mã xác thực tài khoản BeautyGlow AI',
-      text: `Mã OTP BeautyGlow AI của bạn là ${otp}. Mã có hiệu lực trong 5 phút.`,
-      html: `
-        <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:24px">
-          <h2 style="color:#c06fbb">BeautyGlow AI</h2>
-          <p>Xin chào,</p>
-          <p>Mã xác thực OTP của bạn là:</p>
-          <h1 style="letter-spacing:8px;color:#c06fbb">${otp}</h1>
-          <p>Mã có hiệu lực trong <b>5 phút</b>.</p>
-          <p>Nếu bạn không thực hiện yêu cầu này, hãy bỏ qua email.</p>
-        </div>
-      `
-    });
-
-    console.log('[OTP] Đã gửi email tới:', user.email);
-
-    return DEV ? otp : undefined;
-
-  } catch (error) {
-    console.error('[GMAIL SMTP ERROR]', error);
-    throw new Error('Không thể gửi email OTP. Vui lòng thử lại.');
-  } finally {
-    transporter.close();
-  }
+  // Trả OTP về Frontend
+  return otp;
 }
+
+
 /* =========================================
    4. KIỂM TRA SERVER
 ========================================= */
 
+// Kiểm tra trạng thái Backend
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'OK',
@@ -188,7 +152,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Kiểm tra cả kết nối Database
+// Kiểm tra kết nối Database
 app.get('/api/health/db', h(async (req, res) => {
   await db.query('SELECT 1');
 
@@ -199,11 +163,15 @@ app.get('/api/health/db', h(async (req, res) => {
   });
 }));
 
+
 /* =========================================
    5. XÁC THỰC TÀI KHOẢN
 ========================================= */
 
-// Đăng ký
+// =========================================
+// ĐĂNG KÝ - OTP DEMO KHÔNG CẦN GMAIL
+// =========================================
+
 app.post('/api/auth/register', h(async (req, res) => {
   const {
     name = '',
@@ -214,6 +182,7 @@ app.post('/api/auth/register', h(async (req, res) => {
 
   const e = String(email).trim().toLowerCase();
 
+  // Kiểm tra dữ liệu đầu vào
   if (!String(name).trim() || !e || !password) {
     return bad(res, 'Vui lòng nhập đủ họ tên, email và mật khẩu.');
   }
@@ -230,6 +199,7 @@ app.post('/api/auth/register', h(async (req, res) => {
     return bad(res, 'Mật khẩu xác nhận không khớp.');
   }
 
+  // Kiểm tra email đã tồn tại
   const [[existing]] = await db.query(
     'SELECT id, verified FROM users WHERE email = ?',
     [e]
@@ -239,16 +209,19 @@ app.post('/api/auth/register', h(async (req, res) => {
     return bad(res, 'Email này đã được đăng ký.', 409);
   }
 
+  // Mã hóa mật khẩu
   const hash = await bcrypt.hash(password, 10);
 
   let id = existing?.id;
 
   if (id) {
+    // Cập nhật tài khoản chưa xác thực
     await db.query(
       'UPDATE users SET name = ?, password_hash = ? WHERE id = ?',
       [String(name).trim(), hash, id]
     );
   } else {
+    // Tạo tài khoản mới
     const [result] = await db.query(
       'INSERT INTO users(name, email, password_hash) VALUES(?,?,?)',
       [String(name).trim(), e, hash]
@@ -257,18 +230,34 @@ app.post('/api/auth/register', h(async (req, res) => {
     id = result.insertId;
   }
 
-  res.json({
-    message: 'Đã gửi mã OTP.',
-    devOtp: await sendOtp({ id, email: e })
+  // Tạo OTP demo, không gửi email
+  const otp = await sendOtp({
+    id,
+    email: e
+  });
+
+  // Trả OTP về Frontend để hiển thị
+  return res.json({
+    success: true,
+    message: `Mã OTP của bạn là ${otp}. Mã có hiệu lực trong 5 phút.`,
+    devOtp: otp,
+    email: e
   });
 }));
 
-// Xác thực OTP
+
+// =========================================
+// XÁC THỰC OTP
+// =========================================
+
 app.post('/api/auth/verify-otp', h(async (req, res) => {
   const email = String(req.body.email || '')
     .trim()
     .toLowerCase();
 
+  const otp = String(req.body.otp || '');
+
+  // Tìm tài khoản
   const [[user]] = await db.query(
     `SELECT *,
             otp_exp < NOW() AS expired
@@ -278,15 +267,23 @@ app.post('/api/auth/verify-otp', h(async (req, res) => {
   );
 
   if (!user || !user.otp) {
-    return bad(res, 'Không có yêu cầu xác thực. Hãy thử lại từ đầu.');
+    return bad(
+      res,
+      'Không có yêu cầu xác thực. Hãy thử lại từ đầu.'
+    );
   }
 
+  // Kiểm tra thời hạn OTP
   if (user.expired) {
-    return bad(res, 'Mã OTP đã hết hạn. Hãy gửi lại mã.');
+    return bad(
+      res,
+      'Mã OTP đã hết hạn. Hãy gửi lại mã.'
+    );
   }
 
+  // Kiểm tra mã OTP
   const valid = await bcrypt.compare(
-    String(req.body.otp || ''),
+    otp,
     user.otp
   );
 
@@ -294,31 +291,51 @@ app.post('/api/auth/verify-otp', h(async (req, res) => {
     return bad(res, 'Mã OTP không đúng.');
   }
 
+  // Xác thực tài khoản
   await db.query(
-    'UPDATE users SET verified = 1, otp = NULL, otp_exp = NULL WHERE id = ?',
+    `UPDATE users
+     SET verified = 1,
+         otp = NULL,
+         otp_exp = NULL
+     WHERE id = ?`,
     [user.id]
   );
 
-  res.json({
-    message: 'Xác thực thành công.',
+  return res.json({
+    success: true,
+    message: 'Xác thực tài khoản thành công.',
     resetToken: req.body.purpose === 'reset'
       ? jwt.sign(
-          { id: user.id, purpose: 'reset' },
+          {
+            id: user.id,
+            purpose: 'reset'
+          },
           SECRET,
-          { expiresIn: '10m' }
+          {
+            expiresIn: '10m'
+          }
         )
       : undefined
   });
 }));
 
-// Gửi lại OTP
+
+// =========================================
+// GỬI LẠI OTP - CHẾ ĐỘ DEMO
+// =========================================
+
 const resend = h(async (req, res) => {
   const email = String(req.body.email || '')
     .trim()
     .toLowerCase();
 
+  if (!email || !mailOk(email)) {
+    return bad(res, 'Email không hợp lệ.');
+  }
+
+  // Tìm tài khoản
   const [[user]] = await db.query(
-    'SELECT id, email FROM users WHERE email = ?',
+    'SELECT id, email, verified FROM users WHERE email = ?',
     [email]
   );
 
@@ -326,16 +343,29 @@ const resend = h(async (req, res) => {
     return bad(res, 'Email này chưa được đăng ký.', 404);
   }
 
-  res.json({
-    message: 'Đã gửi mã OTP.',
-    devOtp: await sendOtp(user)
+  if (user.verified) {
+    return bad(res, 'Tài khoản đã được xác thực.');
+  }
+
+  // Tạo OTP mới
+  const otp = await sendOtp(user);
+
+  return res.json({
+    success: true,
+    message: `Mã OTP mới của bạn là ${otp}. Mã có hiệu lực trong 5 phút.`,
+    devOtp: otp,
+    email: user.email
   });
 });
 
 app.post('/api/auth/resend-otp', resend);
 app.post('/api/auth/forgot', resend);
 
-// Đặt lại mật khẩu
+
+// =========================================
+// ĐẶT LẠI MẬT KHẨU
+// =========================================
+
 app.post('/api/auth/reset', h(async (req, res) => {
   const {
     resetToken,
@@ -345,70 +375,103 @@ app.post('/api/auth/reset', h(async (req, res) => {
 
   let payload;
 
+  // Kiểm tra Token
   try {
     payload = jwt.verify(resetToken, SECRET);
   } catch {
-    return bad(res, 'Phiên đặt lại mật khẩu đã hết hạn. Hãy xác thực OTP lại.');
+    return bad(
+      res,
+      'Phiên đặt lại mật khẩu đã hết hạn. Hãy xác thực OTP lại.'
+    );
   }
 
   if (payload.purpose !== 'reset') {
     return bad(res, 'Phiên không hợp lệ.');
   }
 
+  // Kiểm tra mật khẩu mới
   if (!pwOk(password)) {
-    return bad(res, 'Mật khẩu cần ít nhất 8 ký tự, gồm cả chữ và số.');
+    return bad(
+      res,
+      'Mật khẩu cần ít nhất 8 ký tự, gồm cả chữ và số.'
+    );
   }
 
   if (password !== confirm) {
     return bad(res, 'Mật khẩu xác nhận không khớp.');
   }
 
+  // Cập nhật mật khẩu
+  const hash = await bcrypt.hash(password, 10);
+
   await db.query(
     'UPDATE users SET password_hash = ? WHERE id = ?',
-    [await bcrypt.hash(password, 10), payload.id]
+    [hash, payload.id]
   );
 
-  res.json({ message: 'Đã đổi mật khẩu.' });
+  return res.json({
+    success: true,
+    message: 'Đã đổi mật khẩu thành công.'
+  });
 }));
 
-// Đăng nhập
+
+// =========================================
+// ĐĂNG NHẬP
+// =========================================
+
 app.post('/api/auth/login', h(async (req, res) => {
   const email = String(req.body.email || '')
     .trim()
     .toLowerCase();
 
-  if (!email || !req.body.password) {
+  const password = req.body.password || '';
+
+  if (!email || !password) {
     return bad(res, 'Hãy nhập đủ email và mật khẩu.');
   }
 
+  // Tìm tài khoản
   const [[user]] = await db.query(
     'SELECT * FROM users WHERE email = ?',
     [email]
   );
 
+  // Kiểm tra tài khoản và mật khẩu
   if (
     !user ||
-    !(await bcrypt.compare(req.body.password, user.password_hash))
+    !(await bcrypt.compare(password, user.password_hash))
   ) {
     return bad(res, 'Email hoặc mật khẩu không đúng.', 401);
   }
 
+  // Tài khoản chưa xác thực
   if (!user.verified) {
+    const otp = await sendOtp(user);
+
     return res.status(403).json({
-      error: 'Tài khoản chưa xác thực. Đã gửi mã OTP mới.',
+      success: false,
+      error: 'Tài khoản chưa xác thực.',
+      message: `Mã OTP của bạn là ${otp}. Mã có hiệu lực trong 5 phút.`,
       needOtp: true,
       email,
-      devOtp: await sendOtp(user)
+      devOtp: otp
     });
   }
 
-  res.json({
+  // Đăng nhập thành công
+  return res.json({
+    success: true,
     token: sign(user),
     user: pub(user)
   });
 }));
 
-// Lấy thông tin tài khoản hiện tại
+
+// =========================================
+// LẤY THÔNG TIN TÀI KHOẢN HIỆN TẠI
+// =========================================
+
 app.get('/api/auth/me', auth, h(async (req, res) => {
   const [[user]] = await db.query(
     'SELECT * FROM users WHERE id = ?',
@@ -419,10 +482,16 @@ app.get('/api/auth/me', auth, h(async (req, res) => {
     return bad(res, 'Tài khoản không tồn tại.', 401);
   }
 
-  res.json({ user: pub(user) });
+  return res.json({
+    user: pub(user)
+  });
 }));
 
-// Cập nhật thông tin cá nhân
+
+// =========================================
+// CẬP NHẬT THÔNG TIN CÁ NHÂN
+// =========================================
+
 app.put('/api/auth/me', auth, h(async (req, res) => {
   const {
     name = '',
@@ -435,11 +504,18 @@ app.put('/api/auth/me', auth, h(async (req, res) => {
   }
 
   if (phone && !/^0\d{9}$/.test(phone.trim())) {
-    return bad(res, 'Số điện thoại gồm 10 số và bắt đầu bằng 0.');
+    return bad(
+      res,
+      'Số điện thoại gồm 10 số và bắt đầu bằng 0.'
+    );
   }
 
   await db.query(
-    'UPDATE users SET name = ?, phone = ?, address = ? WHERE id = ?',
+    `UPDATE users
+     SET name = ?,
+         phone = ?,
+         address = ?
+     WHERE id = ?`,
     [
       name.trim(),
       phone.trim(),
@@ -453,10 +529,16 @@ app.put('/api/auth/me', auth, h(async (req, res) => {
     [req.user.id]
   );
 
-  res.json({ user: pub(user) });
+  return res.json({
+    user: pub(user)
+  });
 }));
 
-// Đổi mật khẩu khi đã đăng nhập
+
+// =========================================
+// ĐỔI MẬT KHẨU KHI ĐÃ ĐĂNG NHẬP
+// =========================================
+
 app.put('/api/auth/password', auth, h(async (req, res) => {
   const {
     current = '',
@@ -464,29 +546,42 @@ app.put('/api/auth/password', auth, h(async (req, res) => {
     confirm
   } = req.body;
 
+  // Lấy thông tin tài khoản
   const [[user]] = await db.query(
     'SELECT * FROM users WHERE id = ?',
     [req.user.id]
   );
 
-  if (!user || !(await bcrypt.compare(current, user.password_hash))) {
+  if (
+    !user ||
+    !(await bcrypt.compare(current, user.password_hash))
+  ) {
     return bad(res, 'Mật khẩu hiện tại không đúng.');
   }
 
   if (!pwOk(password)) {
-    return bad(res, 'Mật khẩu mới cần ít nhất 8 ký tự, gồm cả chữ và số.');
+    return bad(
+      res,
+      'Mật khẩu mới cần ít nhất 8 ký tự, gồm cả chữ và số.'
+    );
   }
 
   if (password !== confirm) {
     return bad(res, 'Mật khẩu xác nhận không khớp.');
   }
 
+  // Cập nhật mật khẩu mới
+  const hash = await bcrypt.hash(password, 10);
+
   await db.query(
     'UPDATE users SET password_hash = ? WHERE id = ?',
-    [await bcrypt.hash(password, 10), user.id]
+    [hash, user.id]
   );
 
-  res.json({ message: 'Đã đổi mật khẩu.' });
+  return res.json({
+    success: true,
+    message: 'Đổi mật khẩu thành công.'
+  });
 }));
 
 /* =========================================
