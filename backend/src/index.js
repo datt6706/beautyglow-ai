@@ -5,13 +5,12 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { Resend } from 'resend';
+import nodemailer from 'nodemailer';
 
 import { db } from './db.js';
 import { advise } from './chatbot.js';
 
 const app = express();
-const resendClient = new Resend(process.env.RESEND_API_KEY);
 
 /* =========================================
    1. CẤU HÌNH SERVER
@@ -110,12 +109,13 @@ const tags = product => ({
     : product.tags || []
 });
 
-/* =========================================
-   3. OTP
-========================================= */
 
-// Tạo và gửi mã OTP qua email bằng Resend
+// =========================================
+// 3. OTP - GỬI EMAIL BẰNG GMAIL SMTP
+// =========================================
+
 async function sendOtp(user) {
+  // Tạo mã OTP 6 chữ số
   const otp = String(
     crypto.randomInt(100000, 1000000)
   );
@@ -131,38 +131,52 @@ async function sendOtp(user) {
     [hashedOtp, user.id]
   );
 
-  if (!process.env.RESEND_API_KEY) {
-    throw new Error('Chưa cấu hình RESEND_API_KEY.');
+  // Kiểm tra cấu hình Gmail
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
+    throw new Error('Chưa cấu hình SMTP_USER hoặc SMTP_PASS trong file .env');
   }
 
-  // Gửi email OTP
-  const { data, error } = await resendClient.emails.send({
-    from: 'BeautyGlow AI <onboarding@resend.dev>',
-    to: [user.email],
-    subject: 'Mã xác thực tài khoản BeautyGlow AI',
-    html: `
-      <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:24px">
-        <h2 style="color:#c06fbb">BeautyGlow AI</h2>
-        <p>Xin chào,</p>
-        <p>Mã xác thực OTP của bạn là:</p>
-        <h1 style="letter-spacing:8px;color:#c06fbb">${otp}</h1>
-        <p>Mã có hiệu lực trong <b>5 phút</b>.</p>
-        <p>Nếu bạn không thực hiện yêu cầu này, hãy bỏ qua email.</p>
-      </div>
-    `,
-    text: `Ma OTP BeautyGlow AI cua ban la ${otp}. Ma co hieu luc trong 5 phut.`
+  // Tạo kết nối Gmail SMTP
+  const transporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
+    }
   });
 
-  if (error) {
-    console.error('[RESEND ERROR]', error);
+  try {
+    // Gửi email OTP
+    await transporter.sendMail({
+      from: `"BeautyGlow AI" <${process.env.SMTP_USER}>`,
+      to: user.email,
+      subject: 'Mã xác thực tài khoản BeautyGlow AI',
+      text: `Mã OTP BeautyGlow AI của bạn là ${otp}. Mã có hiệu lực trong 5 phút.`,
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:24px">
+          <h2 style="color:#c06fbb">BeautyGlow AI</h2>
+          <p>Xin chào,</p>
+          <p>Mã xác thực OTP của bạn là:</p>
+          <h1 style="letter-spacing:8px;color:#c06fbb">${otp}</h1>
+          <p>Mã có hiệu lực trong <b>5 phút</b>.</p>
+          <p>Nếu bạn không thực hiện yêu cầu này, hãy bỏ qua email.</p>
+        </div>
+      `
+    });
+
+    console.log('[OTP] Đã gửi email tới:', user.email);
+
+    return DEV ? otp : undefined;
+
+  } catch (error) {
+    console.error('[GMAIL SMTP ERROR]', error);
     throw new Error('Không thể gửi email OTP. Vui lòng thử lại.');
+  } finally {
+    transporter.close();
   }
-
-  console.log('[OTP] Đã gửi email tới:', user.email);
-
-  return DEV ? otp : undefined;
 }
-
 /* =========================================
    4. KIỂM TRA SERVER
 ========================================= */
