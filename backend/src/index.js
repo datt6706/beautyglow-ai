@@ -5,11 +5,13 @@ import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { Resend } from 'resend';
 
 import { db } from './db.js';
 import { advise } from './chatbot.js';
 
 const app = express();
+const resendClient = new Resend(process.env.RESEND_API_KEY);
 
 /* =========================================
    1. CẤU HÌNH SERVER
@@ -112,12 +114,13 @@ const tags = product => ({
    3. OTP
 ========================================= */
 
-// Tạo và lưu mã OTP
+// Tạo và gửi mã OTP qua email bằng Resend
 async function sendOtp(user) {
   const otp = String(
     crypto.randomInt(100000, 1000000)
   );
 
+  // Mã hóa OTP trước khi lưu vào database
   const hashedOtp = await bcrypt.hash(otp, 8);
 
   await db.query(
@@ -128,9 +131,35 @@ async function sendOtp(user) {
     [hashedOtp, user.id]
   );
 
-  console.log(`[OTP] ${user.email}: ${otp}`);
+  if (!process.env.RESEND_API_KEY) {
+    throw new Error('Chưa cấu hình RESEND_API_KEY.');
+  }
 
-  // Chỉ trả OTP trong môi trường phát triển
+  // Gửi email OTP
+  const { data, error } = await resendClient.emails.send({
+    from: 'BeautyGlow AI <onboarding@resend.dev>',
+    to: [user.email],
+    subject: 'Mã xác thực tài khoản BeautyGlow AI',
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:24px">
+        <h2 style="color:#c06fbb">BeautyGlow AI</h2>
+        <p>Xin chào,</p>
+        <p>Mã xác thực OTP của bạn là:</p>
+        <h1 style="letter-spacing:8px;color:#c06fbb">${otp}</h1>
+        <p>Mã có hiệu lực trong <b>5 phút</b>.</p>
+        <p>Nếu bạn không thực hiện yêu cầu này, hãy bỏ qua email.</p>
+      </div>
+    `,
+    text: `Ma OTP BeautyGlow AI cua ban la ${otp}. Ma co hieu luc trong 5 phut.`
+  });
+
+  if (error) {
+    console.error('[RESEND ERROR]', error);
+    throw new Error('Không thể gửi email OTP. Vui lòng thử lại.');
+  }
+
+  console.log('[OTP] Đã gửi email tới:', user.email);
+
   return DEV ? otp : undefined;
 }
 
