@@ -1,271 +1,1184 @@
+
 import 'dotenv/config';
 import crypto from 'crypto';
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+
 import { db } from './db.js';
 import { advise } from './chatbot.js';
 
 const app = express();
-app.use(cors({ origin: process.env.CLIENT_URL || true }));
-app.use(express.json());
+
+/* =========================================
+   1. CẤU HÌNH SERVER
+========================================= */
+
+const PORT = Number(process.env.PORT) || 5000;
+
+const CLIENT_URL = process.env.CLIENT_URL || 'http://localhost:5173';
 
 const SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-const DEV = process.env.NODE_ENV !== 'production';
-const STAT = ['Chờ xác nhận', 'Đang chuẩn bị', 'Đang giao', 'Hoàn tất', 'Đã hủy'];
-class Err extends Error {}
-const h = f => (q, s, n) => f(q, s).catch(n);
-const bad = (s, m, c = 400) => s.status(c).json({ error: m });
-const sign = u => jwt.sign({ id: u.id, role: u.role }, SECRET, { expiresIn: '7d' });
-const tokenOf = q => (q.headers.authorization || '').replace('Bearer ', '');
-const auth = (q, s, n) => { try { q.user = jwt.verify(tokenOf(q), SECRET); n(); } catch { bad(s, 'Vui lòng đăng nhập.', 401); } };
-const maybe = (q, s, n) => { try { q.user = jwt.verify(tokenOf(q), SECRET); } catch { /* khách vãng lai */ } n(); };
-const admin = [auth, (q, s, n) => (q.user.role === 'admin' ? n() : bad(s, 'Bạn không có quyền truy cập.', 403))];
-const mailOk = e => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
-const pwOk = p => /^(?=.*[A-Za-z])(?=.*\d).{8,}$/.test(p);
-const pub = u => ({ id: u.id, name: u.name, email: u.email, role: u.role, phone: u.phone, address: u.address });
-const tags = r => ({ ...r, tags: typeof r.tags === 'string' ? JSON.parse(r.tags) : r.tags || [] });
 
-// OTP: ghi ra console; ở môi trường dev còn trả về để hiển thị (chưa tích hợp gửi email)
-async function sendOtp(u) {
-  const otp = String(crypto.randomInt(100000, 1000000));
-  await db.query('UPDATE users SET otp=?, otp_exp=DATE_ADD(NOW(), INTERVAL 5 MINUTE) WHERE id=?', [await bcrypt.hash(otp, 8), u.id]);
-  console.log(`[OTP] ${u.email}: ${otp}`);
+const DEV = process.env.NODE_ENV !== 'production';
+
+const STAT = [
+  'Chờ xác nhận',
+  'Đang chuẩn bị',
+  'Đang giao',
+  'Hoàn tất',
+  'Đã hủy'
+];
+
+app.use(cors({
+  origin: CLIENT_URL === '*' ? true : CLIENT_URL
+}));
+
+app.use(express.json({ limit: '1mb' }));
+
+/* =========================================
+   2. HÀM DÙNG CHUNG
+========================================= */
+
+class Err extends Error {}
+
+const h = fn => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+const bad = (res, message, code = 400) =>
+  res.status(code).json({ error: message });
+
+const sign = user =>
+  jwt.sign(
+    { id: user.id, role: user.role },
+    SECRET,
+    { expiresIn: '7d' }
+  );
+
+const tokenOf = req =>
+  (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+
+const auth = (req, res, next) => {
+  try {
+    req.user = jwt.verify(tokenOf(req), SECRET);
+    next();
+  } catch {
+    return bad(res, 'Vui lòng đăng nhập.', 401);
+  }
+};
+
+const maybe = (req, res, next) => {
+  try {
+    req.user = jwt.verify(tokenOf(req), SECRET);
+  } catch {
+    req.user = null;
+  }
+
+  next();
+};
+
+const admin = [
+  auth,
+  (req, res, next) => {
+    if (req.user.role === 'admin') return next();
+    return bad(res, 'Bạn không có quyền truy cập.', 403);
+  }
+];
+
+const mailOk = email =>
+  /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+const pwOk = password =>
+  /^(?=.*[A-Za-z])(?=.*\d).{8,}$/.test(password);
+
+const pub = user => ({
+  id: user.id,
+  name: user.name,
+  email: user.email,
+  role: user.role,
+  phone: user.phone,
+  address: user.address
+});
+
+const tags = product => ({
+  ...product,
+  tags: typeof product.tags === 'string'
+    ? JSON.parse(product.tags)
+    : product.tags || []
+});
+
+/* =========================================
+   3. OTP
+========================================= */
+
+// Tạo và lưu mã OTP
+async function sendOtp(user) {
+  const otp = String(
+    crypto.randomInt(100000, 1000000)
+  );
+
+  const hashedOtp = await bcrypt.hash(otp, 8);
+
+  await db.query(
+    `UPDATE users
+     SET otp = ?,
+         otp_exp = DATE_ADD(NOW(), INTERVAL 5 MINUTE)
+     WHERE id = ?`,
+    [hashedOtp, user.id]
+  );
+
+  console.log(`[OTP] ${user.email}: ${otp}`);
+
+  // Chỉ trả OTP trong môi trường phát triển
   return DEV ? otp : undefined;
 }
 
-/* ============ Xác thực ============ */
-app.post('/api/auth/register', h(async (q, s) => {
-  const { name = '', email = '', password = '', confirm } = q.body;
-  const e = email.trim().toLowerCase();
-  if (!name.trim() || !e || !password) return bad(s, 'Vui lòng nhập đủ họ tên, email và mật khẩu.');
-  if (!mailOk(e)) return bad(s, 'Email không đúng định dạng.');
-  if (!pwOk(password)) return bad(s, 'Mật khẩu cần ít nhất 8 ký tự, gồm cả chữ và số.');
-  if (password !== confirm) return bad(s, 'Mật khẩu xác nhận không khớp.');
-  const [[ex]] = await db.query('SELECT id, verified FROM users WHERE email=?', [e]);
-  if (ex?.verified) return bad(s, 'Email này đã được đăng ký.', 409);
-  const hash = await bcrypt.hash(password, 10);
-  let id = ex?.id;
-  if (id) await db.query('UPDATE users SET name=?, password_hash=? WHERE id=?', [name.trim(), hash, id]);
-  else id = (await db.query('INSERT INTO users(name,email,password_hash) VALUES(?,?,?)', [name.trim(), e, hash]))[0].insertId;
-  s.json({ message: 'Đã gửi mã OTP.', devOtp: await sendOtp({ id, email: e }) });
-}));
+/* =========================================
+   4. KIỂM TRA SERVER
+========================================= */
 
-app.post('/api/auth/verify-otp', h(async (q, s) => {
-  const e = (q.body.email || '').trim().toLowerCase();
-  const [[u]] = await db.query('SELECT *, otp_exp < NOW() AS expired FROM users WHERE email=?', [e]);
-  if (!u || !u.otp) return bad(s, 'Không có yêu cầu xác thực. Hãy thử lại từ đầu.');
-  if (u.expired) return bad(s, 'Mã OTP đã hết hạn. Hãy gửi lại mã.');
-  if (!(await bcrypt.compare(String(q.body.otp || ''), u.otp))) return bad(s, 'Mã OTP không đúng.');
-  await db.query('UPDATE users SET verified=1, otp=NULL, otp_exp=NULL WHERE id=?', [u.id]);
-  s.json({ message: 'Xác thực thành công.', resetToken: q.body.purpose === 'reset' ? jwt.sign({ id: u.id, purpose: 'reset' }, SECRET, { expiresIn: '10m' }) : undefined });
-}));
-
-const resend = h(async (q, s) => {
-  const [[u]] = await db.query('SELECT id, email FROM users WHERE email=?', [(q.body.email || '').trim().toLowerCase()]);
-  if (!u) return bad(s, 'Email này chưa được đăng ký.', 404);
-  s.json({ message: 'Đã gửi mã OTP.', devOtp: await sendOtp(u) });
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'OK',
+    message: 'BeautyGlow AI Backend đang hoạt động'
+  });
 });
+
+// Kiểm tra cả kết nối Database
+app.get('/api/health/db', h(async (req, res) => {
+  await db.query('SELECT 1');
+
+  res.json({
+    status: 'OK',
+    database: process.env.DB_NAME || 'beautyglow',
+    message: 'Kết nối MySQL thành công'
+  });
+}));
+
+/* =========================================
+   5. XÁC THỰC TÀI KHOẢN
+========================================= */
+
+// Đăng ký
+app.post('/api/auth/register', h(async (req, res) => {
+  const {
+    name = '',
+    email = '',
+    password = '',
+    confirm
+  } = req.body;
+
+  const e = String(email).trim().toLowerCase();
+
+  if (!String(name).trim() || !e || !password) {
+    return bad(res, 'Vui lòng nhập đủ họ tên, email và mật khẩu.');
+  }
+
+  if (!mailOk(e)) {
+    return bad(res, 'Email không đúng định dạng.');
+  }
+
+  if (!pwOk(password)) {
+    return bad(res, 'Mật khẩu cần ít nhất 8 ký tự, gồm cả chữ và số.');
+  }
+
+  if (password !== confirm) {
+    return bad(res, 'Mật khẩu xác nhận không khớp.');
+  }
+
+  const [[existing]] = await db.query(
+    'SELECT id, verified FROM users WHERE email = ?',
+    [e]
+  );
+
+  if (existing?.verified) {
+    return bad(res, 'Email này đã được đăng ký.', 409);
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+
+  let id = existing?.id;
+
+  if (id) {
+    await db.query(
+      'UPDATE users SET name = ?, password_hash = ? WHERE id = ?',
+      [String(name).trim(), hash, id]
+    );
+  } else {
+    const [result] = await db.query(
+      'INSERT INTO users(name, email, password_hash) VALUES(?,?,?)',
+      [String(name).trim(), e, hash]
+    );
+
+    id = result.insertId;
+  }
+
+  res.json({
+    message: 'Đã gửi mã OTP.',
+    devOtp: await sendOtp({ id, email: e })
+  });
+}));
+
+// Xác thực OTP
+app.post('/api/auth/verify-otp', h(async (req, res) => {
+  const email = String(req.body.email || '')
+    .trim()
+    .toLowerCase();
+
+  const [[user]] = await db.query(
+    `SELECT *,
+            otp_exp < NOW() AS expired
+     FROM users
+     WHERE email = ?`,
+    [email]
+  );
+
+  if (!user || !user.otp) {
+    return bad(res, 'Không có yêu cầu xác thực. Hãy thử lại từ đầu.');
+  }
+
+  if (user.expired) {
+    return bad(res, 'Mã OTP đã hết hạn. Hãy gửi lại mã.');
+  }
+
+  const valid = await bcrypt.compare(
+    String(req.body.otp || ''),
+    user.otp
+  );
+
+  if (!valid) {
+    return bad(res, 'Mã OTP không đúng.');
+  }
+
+  await db.query(
+    'UPDATE users SET verified = 1, otp = NULL, otp_exp = NULL WHERE id = ?',
+    [user.id]
+  );
+
+  res.json({
+    message: 'Xác thực thành công.',
+    resetToken: req.body.purpose === 'reset'
+      ? jwt.sign(
+          { id: user.id, purpose: 'reset' },
+          SECRET,
+          { expiresIn: '10m' }
+        )
+      : undefined
+  });
+}));
+
+// Gửi lại OTP
+const resend = h(async (req, res) => {
+  const email = String(req.body.email || '')
+    .trim()
+    .toLowerCase();
+
+  const [[user]] = await db.query(
+    'SELECT id, email FROM users WHERE email = ?',
+    [email]
+  );
+
+  if (!user) {
+    return bad(res, 'Email này chưa được đăng ký.', 404);
+  }
+
+  res.json({
+    message: 'Đã gửi mã OTP.',
+    devOtp: await sendOtp(user)
+  });
+});
+
 app.post('/api/auth/resend-otp', resend);
 app.post('/api/auth/forgot', resend);
 
-app.post('/api/auth/reset', h(async (q, s) => {
-  const { resetToken, password = '', confirm } = q.body;
-  let p; try { p = jwt.verify(resetToken, SECRET); } catch { return bad(s, 'Phiên đặt lại mật khẩu đã hết hạn. Hãy xác thực OTP lại.'); }
-  if (p.purpose !== 'reset') return bad(s, 'Phiên không hợp lệ.');
-  if (!pwOk(password)) return bad(s, 'Mật khẩu cần ít nhất 8 ký tự, gồm cả chữ và số.');
-  if (password !== confirm) return bad(s, 'Mật khẩu xác nhận không khớp.');
-  await db.query('UPDATE users SET password_hash=? WHERE id=?', [await bcrypt.hash(password, 10), p.id]);
-  s.json({ message: 'Đã đổi mật khẩu.' });
+// Đặt lại mật khẩu
+app.post('/api/auth/reset', h(async (req, res) => {
+  const {
+    resetToken,
+    password = '',
+    confirm
+  } = req.body;
+
+  let payload;
+
+  try {
+    payload = jwt.verify(resetToken, SECRET);
+  } catch {
+    return bad(res, 'Phiên đặt lại mật khẩu đã hết hạn. Hãy xác thực OTP lại.');
+  }
+
+  if (payload.purpose !== 'reset') {
+    return bad(res, 'Phiên không hợp lệ.');
+  }
+
+  if (!pwOk(password)) {
+    return bad(res, 'Mật khẩu cần ít nhất 8 ký tự, gồm cả chữ và số.');
+  }
+
+  if (password !== confirm) {
+    return bad(res, 'Mật khẩu xác nhận không khớp.');
+  }
+
+  await db.query(
+    'UPDATE users SET password_hash = ? WHERE id = ?',
+    [await bcrypt.hash(password, 10), payload.id]
+  );
+
+  res.json({ message: 'Đã đổi mật khẩu.' });
 }));
 
-app.post('/api/auth/login', h(async (q, s) => {
-  const e = (q.body.email || '').trim().toLowerCase();
-  if (!e || !q.body.password) return bad(s, 'Hãy nhập đủ email và mật khẩu.');
-  const [[u]] = await db.query('SELECT * FROM users WHERE email=?', [e]);
-  if (!u || !(await bcrypt.compare(q.body.password, u.password_hash))) return bad(s, 'Email hoặc mật khẩu không đúng.', 401);
-  if (!u.verified) return s.status(403).json({ error: 'Tài khoản chưa xác thực. Đã gửi mã OTP mới.', needOtp: true, email: e, devOtp: await sendOtp(u) });
-  s.json({ token: sign(u), user: pub(u) });
+// Đăng nhập
+app.post('/api/auth/login', h(async (req, res) => {
+  const email = String(req.body.email || '')
+    .trim()
+    .toLowerCase();
+
+  if (!email || !req.body.password) {
+    return bad(res, 'Hãy nhập đủ email và mật khẩu.');
+  }
+
+  const [[user]] = await db.query(
+    'SELECT * FROM users WHERE email = ?',
+    [email]
+  );
+
+  if (
+    !user ||
+    !(await bcrypt.compare(req.body.password, user.password_hash))
+  ) {
+    return bad(res, 'Email hoặc mật khẩu không đúng.', 401);
+  }
+
+  if (!user.verified) {
+    return res.status(403).json({
+      error: 'Tài khoản chưa xác thực. Đã gửi mã OTP mới.',
+      needOtp: true,
+      email,
+      devOtp: await sendOtp(user)
+    });
+  }
+
+  res.json({
+    token: sign(user),
+    user: pub(user)
+  });
 }));
 
-app.get('/api/auth/me', auth, h(async (q, s) => {
-  const [[u]] = await db.query('SELECT * FROM users WHERE id=?', [q.user.id]);
-  u ? s.json({ user: pub(u) }) : bad(s, 'Tài khoản không tồn tại.', 401);
-}));
-app.put('/api/auth/me', auth, h(async (q, s) => {
-  const { name = '', phone = '', address = '' } = q.body;
-  if (!name.trim()) return bad(s, 'Họ tên không được để trống.');
-  if (phone && !/^0\d{9}$/.test(phone.trim())) return bad(s, 'Số điện thoại gồm 10 số và bắt đầu bằng 0.');
-  await db.query('UPDATE users SET name=?, phone=?, address=? WHERE id=?', [name.trim(), phone.trim(), address.trim(), q.user.id]);
-  const [[u]] = await db.query('SELECT * FROM users WHERE id=?', [q.user.id]);
-  s.json({ user: pub(u) });
-}));
-app.put('/api/auth/password', auth, h(async (q, s) => {
-  const { current = '', password = '', confirm } = q.body;
-  const [[u]] = await db.query('SELECT * FROM users WHERE id=?', [q.user.id]);
-  if (!(await bcrypt.compare(current, u.password_hash))) return bad(s, 'Mật khẩu hiện tại không đúng.');
-  if (!pwOk(password)) return bad(s, 'Mật khẩu mới cần ít nhất 8 ký tự, gồm cả chữ và số.');
-  if (password !== confirm) return bad(s, 'Mật khẩu xác nhận không khớp.');
-  await db.query('UPDATE users SET password_hash=? WHERE id=?', [await bcrypt.hash(password, 10), u.id]);
-  s.json({ message: 'Đã đổi mật khẩu.' });
+// Lấy thông tin tài khoản hiện tại
+app.get('/api/auth/me', auth, h(async (req, res) => {
+  const [[user]] = await db.query(
+    'SELECT * FROM users WHERE id = ?',
+    [req.user.id]
+  );
+
+  if (!user) {
+    return bad(res, 'Tài khoản không tồn tại.', 401);
+  }
+
+  res.json({ user: pub(user) });
 }));
 
-/* ============ Danh mục ============ */
-app.get('/api/categories', h(async (q, s) => s.json((await db.query(
-  'SELECT c.*, (SELECT COUNT(*) FROM products p WHERE p.category_id=c.id) AS products FROM categories c ORDER BY c.id'))[0])));
-app.post('/api/categories', admin, h(async (q, s) => {
-  const n = String(q.body.name || '').trim(); if (!n) return bad(s, 'Hãy nhập tên danh mục.');
-  s.json({ id: (await db.query('INSERT INTO categories(name) VALUES(?)', [n]))[0].insertId });
-}));
-app.put('/api/categories/:id', admin, h(async (q, s) => {
-  const n = String(q.body.name || '').trim(); if (!n) return bad(s, 'Hãy nhập tên danh mục.');
-  await db.query('UPDATE categories SET name=? WHERE id=?', [n, q.params.id]); s.json({ ok: true });
-}));
-app.delete('/api/categories/:id', admin, h(async (q, s) => {
-  const [[c]] = await db.query('SELECT COUNT(*) n FROM products WHERE category_id=?', [q.params.id]);
-  if (c.n) return bad(s, 'Danh mục đang có sản phẩm, hãy chuyển sản phẩm sang danh mục khác trước.', 409);
-  await db.query('DELETE FROM categories WHERE id=?', [q.params.id]); s.json({ ok: true });
+// Cập nhật thông tin cá nhân
+app.put('/api/auth/me', auth, h(async (req, res) => {
+  const {
+    name = '',
+    phone = '',
+    address = ''
+  } = req.body;
+
+  if (!String(name).trim()) {
+    return bad(res, 'Họ tên không được để trống.');
+  }
+
+  if (phone && !/^0\d{9}$/.test(phone.trim())) {
+    return bad(res, 'Số điện thoại gồm 10 số và bắt đầu bằng 0.');
+  }
+
+  await db.query(
+    'UPDATE users SET name = ?, phone = ?, address = ? WHERE id = ?',
+    [
+      name.trim(),
+      phone.trim(),
+      address.trim(),
+      req.user.id
+    ]
+  );
+
+  const [[user]] = await db.query(
+    'SELECT * FROM users WHERE id = ?',
+    [req.user.id]
+  );
+
+  res.json({ user: pub(user) });
 }));
 
-/* ============ Sản phẩm ============ */
+// Đổi mật khẩu khi đã đăng nhập
+app.put('/api/auth/password', auth, h(async (req, res) => {
+  const {
+    current = '',
+    password = '',
+    confirm
+  } = req.body;
+
+  const [[user]] = await db.query(
+    'SELECT * FROM users WHERE id = ?',
+    [req.user.id]
+  );
+
+  if (!user || !(await bcrypt.compare(current, user.password_hash))) {
+    return bad(res, 'Mật khẩu hiện tại không đúng.');
+  }
+
+  if (!pwOk(password)) {
+    return bad(res, 'Mật khẩu mới cần ít nhất 8 ký tự, gồm cả chữ và số.');
+  }
+
+  if (password !== confirm) {
+    return bad(res, 'Mật khẩu xác nhận không khớp.');
+  }
+
+  await db.query(
+    'UPDATE users SET password_hash = ? WHERE id = ?',
+    [await bcrypt.hash(password, 10), user.id]
+  );
+
+  res.json({ message: 'Đã đổi mật khẩu.' });
+}));
+
+/* =========================================
+   6. DANH MỤC SẢN PHẨM
+========================================= */
+
+// Lấy danh sách danh mục
+app.get('/api/categories', h(async (req, res) => {
+  const [rows] = await db.query(
+    `SELECT c.*,
+      (SELECT COUNT(*)
+       FROM products p
+       WHERE p.category_id = c.id) AS products
+     FROM categories c
+     ORDER BY c.id`
+  );
+
+  res.json(rows);
+}));
+
+// Thêm danh mục
+app.post('/api/categories', admin, h(async (req, res) => {
+  const name = String(req.body.name || '').trim();
+
+  if (!name) {
+    return bad(res, 'Hãy nhập tên danh mục.');
+  }
+
+  const [result] = await db.query(
+    'INSERT INTO categories(name) VALUES(?)',
+    [name]
+  );
+
+  res.json({ id: result.insertId });
+}));
+
+// Sửa danh mục
+app.put('/api/categories/:id', admin, h(async (req, res) => {
+  const name = String(req.body.name || '').trim();
+
+  if (!name) {
+    return bad(res, 'Hãy nhập tên danh mục.');
+  }
+
+  await db.query(
+    'UPDATE categories SET name = ? WHERE id = ?',
+    [name, req.params.id]
+  );
+
+  res.json({ ok: true });
+}));
+
+// Xóa danh mục
+app.delete('/api/categories/:id', admin, h(async (req, res) => {
+  const [[category]] = await db.query(
+    'SELECT COUNT(*) AS n FROM products WHERE category_id = ?',
+    [req.params.id]
+  );
+
+  if (category.n) {
+    return bad(
+      res,
+      'Danh mục đang có sản phẩm, hãy chuyển sản phẩm sang danh mục khác trước.',
+      409
+    );
+  }
+
+  await db.query(
+    'DELETE FROM categories WHERE id = ?',
+    [req.params.id]
+  );
+
+  res.json({ ok: true });
+}));
+
+/* =========================================
+   7. SẢN PHẨM
+========================================= */
+
 const PRICE = 'COALESCE(NULLIF(p.sale_price,0), p.price)';
-const SEL = 'SELECT p.*, c.name AS category FROM products p JOIN categories c ON c.id=p.category_id';
-const SORT = { sold: 'p.sold DESC', new: 'p.id DESC', asc: PRICE + ' ASC', desc: PRICE + ' DESC' };
-app.get('/api/brands', h(async (q, s) => s.json((await db.query('SELECT DISTINCT brand FROM products WHERE active=1 ORDER BY brand'))[0].map(r => r.brand))));
-app.get('/api/products', h(async (q, s) => {
-  const { q: kw, category, brand, min, max, skin, sort } = q.query, w = ['p.active=1'], a = [];
-  if (kw) { w.push('(p.name LIKE ? OR p.brand LIKE ? OR CAST(p.tags AS CHAR) LIKE ?)'); a.push(...Array(3).fill(`%${kw}%`)); }
-  if (category) { w.push('p.category_id=?'); a.push(category); }
-  if (brand) { w.push('p.brand=?'); a.push(brand); }
-  if (min) { w.push(PRICE + '>=?'); a.push(+min); }
-  if (max) { w.push(PRICE + '<?'); a.push(+max); }
-  if (skin) { w.push('JSON_CONTAINS(p.tags, JSON_QUOTE(?))'); a.push(skin); }
-  s.json((await db.query(`${SEL} WHERE ${w.join(' AND ')} ORDER BY ${SORT[sort] || SORT.sold}`, a))[0].map(tags));
-}));
-app.get('/api/products/:id', h(async (q, s) => {
-  const [[p]] = await db.query(`${SEL} WHERE p.id=? AND p.active=1`, [q.params.id]);
-  p ? s.json(tags(p)) : bad(s, 'Sản phẩm không tồn tại hoặc đã ngừng kinh doanh.', 404);
-}));
-const pbody = b => {
-  const price = +b.price, sale = +b.sale_price || 0, stock = Math.max(0, Math.floor(+b.stock) || 0);
-  if (!String(b.name || '').trim() || !(price > 0) || !b.category_id) throw new Err('Hãy nhập tên, danh mục và giá bán lớn hơn 0.');
-  if (sale && sale >= price) throw new Err('Giá khuyến mãi phải nhỏ hơn giá bán.');
-  const t = (Array.isArray(b.tags) ? b.tags : String(b.tags || '').split(',')).map(x => String(x).trim().toLowerCase()).filter(Boolean);
-  return [String(b.name).trim(), String(b.brand || 'Khác').trim(), +b.category_id, price, sale, stock, b.color || '#c06fbb',
-    b.description || '', b.image_url || '', JSON.stringify(t), b.active === false || b.active === 0 ? 0 : 1];
+
+const SEL = `
+  SELECT p.*, c.name AS category
+  FROM products p
+  JOIN categories c ON c.id = p.category_id
+`;
+
+const SORT = {
+  sold: 'p.sold DESC',
+  new: 'p.id DESC',
+  asc: PRICE + ' ASC',
+  desc: PRICE + ' DESC'
 };
-const COLS = 'name,brand,category_id,price,sale_price,stock,color,description,image_url,tags,active';
-app.get('/api/admin/products', admin, h(async (q, s) => s.json((await db.query(`${SEL} ORDER BY p.id DESC`))[0].map(tags))));
-app.post('/api/products', admin, h(async (q, s) => {
-  s.json({ id: (await db.query(`INSERT INTO products(${COLS}) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, pbody(q.body)))[0].insertId });
-}));
-app.put('/api/products/:id', admin, h(async (q, s) => {
-  await db.query(`UPDATE products SET ${COLS.split(',').map(c => c + '=?').join(',')} WHERE id=?`, [...pbody(q.body), q.params.id]); s.json({ ok: true });
-}));
-app.delete('/api/products/:id', admin, h(async (q, s) => {
-  const [[u]] = await db.query('SELECT COUNT(*) n FROM order_items WHERE product_id=?', [q.params.id]);
-  if (u.n) { await db.query('UPDATE products SET active=0 WHERE id=?', [q.params.id]); return s.json({ ok: true, deactivated: true }); }
-  await db.query('DELETE FROM products WHERE id=?', [q.params.id]); s.json({ ok: true });
+
+// Lấy thương hiệu
+app.get('/api/brands', h(async (req, res) => {
+  const [rows] = await db.query(
+    'SELECT DISTINCT brand FROM products WHERE active = 1 ORDER BY brand'
+  );
+
+  res.json(rows.map(row => row.brand));
 }));
 
-/* ============ Đơn hàng ============ */
+// Lấy danh sách sản phẩm và lọc
+app.get('/api/products', h(async (req, res) => {
+  const {
+    q: keyword,
+    category,
+    brand,
+    min,
+    max,
+    skin,
+    sort
+  } = req.query;
+
+  const where = ['p.active = 1'];
+  const values = [];
+
+  if (keyword) {
+    where.push(
+      '(p.name LIKE ? OR p.brand LIKE ? OR CAST(p.tags AS CHAR) LIKE ?)'
+    );
+
+    values.push(
+      ...Array(3).fill(`%${keyword}%`)
+    );
+  }
+
+  if (category) {
+    where.push('p.category_id = ?');
+    values.push(category);
+  }
+
+  if (brand) {
+    where.push('p.brand = ?');
+    values.push(brand);
+  }
+
+  if (min) {
+    where.push(`${PRICE} >= ?`);
+    values.push(Number(min));
+  }
+
+  if (max) {
+    where.push(`${PRICE} <= ?`);
+    values.push(Number(max));
+  }
+
+  if (skin) {
+    where.push('JSON_CONTAINS(p.tags, JSON_QUOTE(?))');
+    values.push(skin);
+  }
+
+  const orderBy = SORT[sort] || SORT.sold;
+
+  const [rows] = await db.query(
+    `${SEL}
+     WHERE ${where.join(' AND ')}
+     ORDER BY ${orderBy}`,
+    values
+  );
+
+  res.json(rows.map(tags));
+}));
+
+// Chi tiết sản phẩm
+app.get('/api/products/:id', h(async (req, res) => {
+  const [[product]] = await db.query(
+    `${SEL}
+     WHERE p.id = ? AND p.active = 1`,
+    [req.params.id]
+  );
+
+  if (!product) {
+    return bad(res, 'Sản phẩm không tồn tại hoặc đã ngừng kinh doanh.', 404);
+  }
+
+  res.json(tags(product));
+}));
+
+// Kiểm tra dữ liệu sản phẩm
+const pbody = body => {
+  const price = Number(body.price);
+  const sale = Number(body.sale_price) || 0;
+  const stock = Math.max(0, Math.floor(Number(body.stock) || 0));
+
+  if (
+    !String(body.name || '').trim() ||
+    !(price > 0) ||
+    !body.category_id
+  ) {
+    throw new Err('Hãy nhập tên, danh mục và giá bán lớn hơn 0.');
+  }
+
+  if (sale && sale >= price) {
+    throw new Err('Giá khuyến mãi phải nhỏ hơn giá bán.');
+  }
+
+  const productTags = (
+    Array.isArray(body.tags)
+      ? body.tags
+      : String(body.tags || '').split(',')
+  )
+    .map(item => String(item).trim().toLowerCase())
+    .filter(Boolean);
+
+  return [
+    String(body.name).trim(),
+    String(body.brand || 'Khác').trim(),
+    Number(body.category_id),
+    price,
+    sale,
+    stock,
+    body.color || '#c06fbb',
+    body.description || '',
+    body.image_url || '',
+    JSON.stringify(productTags),
+    body.active === false || body.active === 0 ? 0 : 1
+  ];
+};
+
+const COLS =
+  'name,brand,category_id,price,sale_price,stock,color,description,image_url,tags,active';
+
+// Danh sách sản phẩm Admin
+app.get('/api/admin/products', admin, h(async (req, res) => {
+  const [rows] = await db.query(
+    `${SEL} ORDER BY p.id DESC`
+  );
+
+  res.json(rows.map(tags));
+}));
+
+// Thêm sản phẩm
+app.post('/api/products', admin, h(async (req, res) => {
+  const [result] = await db.query(
+    `INSERT INTO products(${COLS})
+     VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+    pbody(req.body)
+  );
+
+  res.json({ id: result.insertId });
+}));
+
+// Cập nhật sản phẩm
+app.put('/api/products/:id', admin, h(async (req, res) => {
+  const columns = COLS.split(',')
+    .map(column => column + ' = ?')
+    .join(', ');
+
+  await db.query(
+    `UPDATE products SET ${columns} WHERE id = ?`,
+    [...pbody(req.body), req.params.id]
+  );
+
+  res.json({ ok: true });
+}));
+
+// Xóa sản phẩm
+app.delete('/api/products/:id', admin, h(async (req, res) => {
+  const [[usage]] = await db.query(
+    'SELECT COUNT(*) AS n FROM order_items WHERE product_id = ?',
+    [req.params.id]
+  );
+
+  if (usage.n) {
+    await db.query(
+      'UPDATE products SET active = 0 WHERE id = ?',
+      [req.params.id]
+    );
+
+    return res.json({
+      ok: true,
+      deactivated: true
+    });
+  }
+
+  await db.query(
+    'DELETE FROM products WHERE id = ?',
+    [req.params.id]
+  );
+
+  res.json({ ok: true });
+}));
+
+/* =========================================
+   8. ĐƠN HÀNG
+========================================= */
+
+// Gắn chi tiết sản phẩm vào đơn hàng
 const withItems = async rows => {
   if (!rows.length) return rows;
-  const [it] = await db.query('SELECT * FROM order_items WHERE order_id IN (?)', [rows.map(r => r.id)]);
-  return rows.map(r => ({ ...r, items: it.filter(i => i.order_id === r.id) }));
+
+  const [items] = await db.query(
+    'SELECT * FROM order_items WHERE order_id IN (?)',
+    [rows.map(row => row.id)]
+  );
+
+  return rows.map(row => ({
+    ...row,
+    items: items.filter(item => item.order_id === row.id)
+  }));
 };
-app.post('/api/orders', auth, h(async (q, s) => {
-  const { items = [], name, phone, address, note = '', payment = 'cod', shipping = 'std', coupon = '' } = q.body;
-  if (!Array.isArray(items) || !items.length) return bad(s, 'Giỏ hàng chưa có sản phẩm.');
-  if (!name?.trim() || !phone?.trim() || !address?.trim()) return bad(s, 'Hãy nhập đủ tên, số điện thoại và địa chỉ nhận hàng.');
-  if (!/^0\d{9}$/.test(phone.trim())) return bad(s, 'Số điện thoại gồm 10 số và bắt đầu bằng 0.');
-  if (!['cod', 'bank', 'vnpay'].includes(payment)) return bad(s, 'Phương thức thanh toán không hợp lệ.');
-  const c = await db.getConnection();
+
+// Tạo đơn hàng
+app.post('/api/orders', auth, h(async (req, res) => {
+  const {
+    items = [],
+    name,
+    phone,
+    address,
+    note = '',
+    payment = 'cod',
+    shipping = 'std',
+    coupon = ''
+  } = req.body;
+
+  if (!Array.isArray(items) || !items.length) {
+    return bad(res, 'Giỏ hàng chưa có sản phẩm.');
+  }
+
+  if (!name?.trim() || !phone?.trim() || !address?.trim()) {
+    return bad(res, 'Hãy nhập đủ tên, số điện thoại và địa chỉ nhận hàng.');
+  }
+
+  if (!/^0\d{9}$/.test(phone.trim())) {
+    return bad(res, 'Số điện thoại gồm 10 số và bắt đầu bằng 0.');
+  }
+
+  if (!['cod', 'bank', 'vnpay'].includes(payment)) {
+    return bad(res, 'Phương thức thanh toán không hợp lệ.');
+  }
+
+  if (!['std', 'fast'].includes(shipping)) {
+    return bad(res, 'Phương thức vận chuyển không hợp lệ.');
+  }
+
+  const connection = await db.getConnection();
+
   try {
-    await c.beginTransaction();
-    let sub = 0; const lines = [];
-    for (const it of items) {
-      const qty = Math.floor(+it.qty);
-      if (!(qty > 0)) throw new Err('Số lượng không hợp lệ.');
-      const [[p]] = await c.query('SELECT * FROM products WHERE id=? AND active=1 FOR UPDATE', [it.id]);
-      if (!p) throw new Err('Có sản phẩm không còn kinh doanh. Hãy cập nhật giỏ hàng.');
-      if (p.stock < qty) throw new Err(`${p.name} chỉ còn ${p.stock} sản phẩm. Hãy điều chỉnh giỏ hàng.`);
-      const price = p.sale_price || p.price; sub += price * qty; lines.push([p.id, p.name, price, qty]);
-    }
-    const cp = String(coupon).toUpperCase();
-    const discount = cp === 'GLOW10' ? Math.round(sub * 0.1) : 0;
-    const fee = sub >= 500000 || cp === 'FREESHIP' ? 0 : shipping === 'fast' ? 50000 : 30000;
-    const total = sub - discount + fee, code = 'BG' + Date.now().toString(36).toUpperCase();
-    const [r] = await c.query('INSERT INTO orders(code,user_id,name,phone,address,note,payment,discount,shipping_fee,total) VALUES(?,?,?,?,?,?,?,?,?,?)',
-      [code, q.user.id, name.trim(), phone.trim(), address.trim(), note, payment, discount, fee, total]);
-    for (const [pid, pn, pr, qty] of lines) {
-      await c.query('INSERT INTO order_items(order_id,product_id,product_name,price,quantity) VALUES(?,?,?,?,?)', [r.insertId, pid, pn, pr, qty]);
-      await c.query('UPDATE products SET stock=stock-?, sold=sold+? WHERE id=?', [qty, qty, pid]);
-    }
-    await c.commit(); s.json({ code, total });
-  } catch (e) { await c.rollback(); throw e; } finally { c.release(); }
-}));
-app.get('/api/orders/mine', auth, h(async (q, s) =>
-  s.json(await withItems((await db.query('SELECT * FROM orders WHERE user_id=? ORDER BY id DESC', [q.user.id]))[0]))));
+    await connection.beginTransaction();
 
-async function setStatus(id, status, uid) {
-  const c = await db.getConnection();
+    let subtotal = 0;
+    const lines = [];
+
+    for (const item of items) {
+      const quantity = Math.floor(Number(item.qty));
+
+      if (!(quantity > 0)) {
+        throw new Err('Số lượng không hợp lệ.');
+      }
+
+      const [[product]] = await connection.query(
+        'SELECT * FROM products WHERE id = ? AND active = 1 FOR UPDATE',
+        [item.id]
+      );
+
+      if (!product) {
+        throw new Err('Có sản phẩm không còn kinh doanh. Hãy cập nhật giỏ hàng.');
+      }
+
+      if (product.stock < quantity) {
+        throw new Err(
+          `${product.name} chỉ còn ${product.stock} sản phẩm. Hãy điều chỉnh giỏ hàng.`
+        );
+      }
+
+      const price = product.sale_price || product.price;
+
+      subtotal += price * quantity;
+
+      lines.push([
+        product.id,
+        product.name,
+        price,
+        quantity
+      ]);
+    }
+
+    const codeCoupon = String(coupon).toUpperCase();
+
+    const discount = codeCoupon === 'GLOW10'
+      ? Math.round(subtotal * 0.1)
+      : 0;
+
+    const shippingFee =
+      subtotal >= 500000 || codeCoupon === 'FREESHIP'
+        ? 0
+        : shipping === 'fast' ? 50000 : 30000;
+
+    const total = subtotal - discount + shippingFee;
+
+    const code =
+      'BG' + Date.now().toString(36).toUpperCase();
+
+    const [order] = await connection.query(
+      `INSERT INTO orders
+       (code,user_id,name,phone,address,note,payment,discount,shipping_fee,total)
+       VALUES(?,?,?,?,?,?,?,?,?,?)`,
+      [
+        code,
+        req.user.id,
+        name.trim(),
+        phone.trim(),
+        address.trim(),
+        note,
+        payment,
+        discount,
+        shippingFee,
+        total
+      ]
+    );
+
+    for (const [productId, productName, price, quantity] of lines) {
+      await connection.query(
+        `INSERT INTO order_items
+         (order_id,product_id,product_name,price,quantity)
+         VALUES(?,?,?,?,?)`,
+        [
+          order.insertId,
+          productId,
+          productName,
+          price,
+          quantity
+        ]
+      );
+
+      await connection.query(
+        'UPDATE products SET stock = stock - ?, sold = sold + ? WHERE id = ?',
+        [quantity, quantity, productId]
+      );
+    }
+
+    await connection.commit();
+
+    res.json({ code, total });
+
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+
+  } finally {
+    connection.release();
+  }
+}));
+
+// Đơn hàng của khách hàng
+app.get('/api/orders/mine', auth, h(async (req, res) => {
+  const [rows] = await db.query(
+    'SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC',
+    [req.user.id]
+  );
+
+  res.json(await withItems(rows));
+}));
+
+// Cập nhật trạng thái đơn hàng
+async function setStatus(id, status, userId) {
+  const connection = await db.getConnection();
+
   try {
-    await c.beginTransaction();
-    const [[o]] = await c.query('SELECT * FROM orders WHERE id=? FOR UPDATE', [id]);
-    if (!o || (uid && o.user_id !== uid)) throw new Err('Không tìm thấy đơn hàng.');
-    if (o.status === 'Đã hủy') throw new Err('Đơn đã hủy không thể thay đổi.');
-    if (uid && o.status !== STAT[0]) throw new Err('Chỉ hủy được đơn đang chờ xác nhận.');
-    if (status === 'Đã hủy') await c.query('UPDATE products p JOIN order_items i ON i.product_id=p.id SET p.stock=p.stock+i.quantity, p.sold=GREATEST(0,p.sold-i.quantity) WHERE i.order_id=?', [id]);
-    await c.query('UPDATE orders SET status=? WHERE id=?', [status, id]);
-    await c.commit();
-  } catch (e) { await c.rollback(); throw e; } finally { c.release(); }
-}
-app.post('/api/orders/:id/cancel', auth, h(async (q, s) => { await setStatus(q.params.id, 'Đã hủy', q.user.id); s.json({ ok: true }); }));
-app.put('/api/admin/orders/:id/status', admin, h(async (q, s) => {
-  if (!STAT.includes(q.body.status)) return bad(s, 'Trạng thái không hợp lệ.');
-  await setStatus(q.params.id, q.body.status); s.json({ ok: true });
-}));
-app.get('/api/admin/orders', admin, h(async (q, s) =>
-  s.json(await withItems((await db.query('SELECT o.*, u.email FROM orders o JOIN users u ON u.id=o.user_id ORDER BY o.id DESC'))[0]))));
-app.get('/api/admin/customers', admin, h(async (q, s) => s.json((await db.query(
-  "SELECT u.id,u.name,u.email,u.phone,u.verified,u.created_at,(SELECT COUNT(*) FROM orders o WHERE o.user_id=u.id) AS orders FROM users u WHERE u.role='customer' ORDER BY u.id DESC"))[0])));
-app.get('/api/admin/stats', admin, h(async (q, s) => {
-  const [[r]] = await db.query("SELECT COALESCE(SUM(CASE WHEN status<>'Đã hủy' THEN total END),0) AS revenue, COUNT(*) AS orders, COALESCE(SUM(status='Chờ xác nhận'),0) AS pending FROM orders");
-  const [[c]] = await db.query("SELECT COUNT(*) n FROM users WHERE role='customer'");
-  const [[l]] = await db.query('SELECT COUNT(*) n FROM products WHERE active=1 AND stock<=5');
-  const [top] = await db.query('SELECT name, sold FROM products ORDER BY sold DESC LIMIT 5');
-  s.json({ revenue: Number(r.revenue), orders: r.orders, pending: Number(r.pending), customers: c.n, lowStock: l.n, top });
-}));
+    await connection.beginTransaction();
 
-/* ============ Chatbot ============ */
-app.post('/api/chat', maybe, h(async (q, s) => {
-  const msg = String(q.body.message || '').trim();
-  if (!msg) return bad(s, 'Hãy nhập câu hỏi trước khi gửi.');
-  if (msg.length > 500) return bad(s, 'Câu hỏi tối đa 500 ký tự.');
-  const list = (await db.query(`${SEL} WHERE p.active=1 AND p.stock>0`))[0].map(tags);
-  const a = await advise(msg, list);
-  const products = a.ids.map(id => list.find(p => p.id === id)).filter(Boolean);
-  await db.query('INSERT INTO chat_logs(user_id,question,answer) VALUES(?,?,?)', [q.user?.id || null, msg, a.reply]);
-  s.json({ reply: a.reply, products, tip: products.length ? a.tip : undefined });
-}));
+    const [[order]] = await connection.query(
+      'SELECT * FROM orders WHERE id = ? FOR UPDATE',
+      [id]
+    );
 
-app.use((e, q, s, n) => {
-  if (e instanceof Err) return bad(s, e.message);
-  if (e.code === 'ER_DUP_ENTRY') return bad(s, 'Dữ liệu này đã tồn tại.', 409);
-  console.error(e); bad(s, 'Lỗi máy chủ, vui lòng thử lại sau.', 500);
-});
+    if (!order || (userId && Number(order.user_id) !== Number(userId))) {
+      throw new Err('Không tìm thấy đơn hàng.');
+    }
 
-async function ensureAdmin() {
-  const email = (process.env.ADMIN_EMAIL || 'admin@beautyglow.vn').toLowerCase();
-  const [[a]] = await db.query('SELECT id FROM users WHERE email=?', [email]);
-  if (!a) {
-    await db.query("INSERT INTO users(name,email,password_hash,role,verified) VALUES('Quản trị viên',?,?, 'admin',1)",
-      [email, await bcrypt.hash(process.env.ADMIN_PASSWORD || 'Admin@123', 10)]);
-    console.log('Đã tạo tài khoản quản trị:', email);
+    if (order.status === 'Đã hủy') {
+      throw new Err('Đơn đã hủy không thể thay đổi.');
+    }
+
+    if (userId && order.status !== STAT[0]) {
+      throw new Err('Chỉ hủy được đơn đang chờ xác nhận.');
+    }
+
+    if (status === 'Đã hủy') {
+      await connection.query(
+        `UPDATE products p
+         JOIN order_items i ON i.product_id = p.id
+         SET p.stock = p.stock + i.quantity,
+             p.sold = GREATEST(0, p.sold - i.quantity)
+         WHERE i.order_id = ?`,
+        [id]
+      );
+    }
+
+    await connection.query(
+      'UPDATE orders SET status = ? WHERE id = ?',
+      [status, id]
+    );
+
+    await connection.commit();
+
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+
+  } finally {
+    connection.release();
   }
 }
-const PORT = process.env.PORT || 5000;
-ensureAdmin().then(() => app.listen(PORT, () => console.log(`API chạy tại http://localhost:${PORT}`)))
-  .catch(e => { console.error('Không kết nối được MySQL:', e.message); process.exit(1); });
+
+// Khách hàng hủy đơn
+app.post('/api/orders/:id/cancel', auth, h(async (req, res) => {
+  await setStatus(
+    req.params.id,
+    'Đã hủy',
+    req.user.id
+  );
+
+  res.json({ ok: true });
+}));
+
+// Admin cập nhật trạng thái
+app.put('/api/admin/orders/:id/status', admin, h(async (req, res) => {
+  if (!STAT.includes(req.body.status)) {
+    return bad(res, 'Trạng thái không hợp lệ.');
+  }
+
+  await setStatus(
+    req.params.id,
+    req.body.status
+  );
+
+  res.json({ ok: true });
+}));
+
+// Danh sách đơn hàng Admin
+app.get('/api/admin/orders', admin, h(async (req, res) => {
+  const [rows] = await db.query(
+    `SELECT o.*, u.email
+     FROM orders o
+     JOIN users u ON u.id = o.user_id
+     ORDER BY o.id DESC`
+  );
+
+  res.json(await withItems(rows));
+}));
+
+// Danh sách khách hàng
+app.get('/api/admin/customers', admin, h(async (req, res) => {
+  const [rows] = await db.query(
+    `SELECT u.id,u.name,u.email,u.phone,u.verified,u.created_at,
+      (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS orders
+     FROM users u
+     WHERE u.role = 'customer'
+     ORDER BY u.id DESC`
+  );
+
+  res.json(rows);
+}));
+
+// Thống kê Admin
+app.get('/api/admin/stats', admin, h(async (req, res) => {
+  const [[result]] = await db.query(
+    `SELECT
+       COALESCE(SUM(CASE WHEN status <> 'Đã hủy' THEN total END),0) AS revenue,
+       COUNT(*) AS orders,
+       COALESCE(SUM(status = 'Chờ xác nhận'),0) AS pending
+     FROM orders`
+  );
+
+  const [[customers]] = await db.query(
+    "SELECT COUNT(*) AS n FROM users WHERE role = 'customer'"
+  );
+
+  const [[lowStock]] = await db.query(
+    'SELECT COUNT(*) AS n FROM products WHERE active = 1 AND stock <= 5'
+  );
+
+  const [top] = await db.query(
+    'SELECT name, sold FROM products ORDER BY sold DESC LIMIT 5'
+  );
+
+  res.json({
+    revenue: Number(result.revenue),
+    orders: result.orders,
+    pending: Number(result.pending),
+    customers: customers.n,
+    lowStock: lowStock.n,
+    top
+  });
+}));
+
+/* =========================================
+   9. CHATBOT BEAUTYGLOW AI
+========================================= */
+
+app.post('/api/chat', maybe, h(async (req, res) => {
+  const message = String(req.body.message || '').trim();
+
+  if (!message) {
+    return bad(res, 'Hãy nhập câu hỏi trước khi gửi.');
+  }
+
+  if (message.length > 500) {
+    return bad(res, 'Câu hỏi tối đa 500 ký tự.');
+  }
+
+  // Lấy sản phẩm đang kinh doanh và còn hàng
+  const [rows] = await db.query(
+    `${SEL}
+     WHERE p.active = 1 AND p.stock > 0`
+  );
+
+  const productsList = rows.map(tags);
+
+  // Gọi Claude AI hoặc luật dự phòng
+  const result = await advise(message, productsList);
+
+  // Lọc sản phẩm được chatbot đề xuất
+  const products = result.ids
+    .map(id => productsList.find(
+      product => String(product.id) === String(id)
+    ))
+    .filter(Boolean);
+
+  // Lưu lịch sử chatbot
+  await db.query(
+    `INSERT INTO chat_logs(user_id,question,answer)
+     VALUES(?,?,?)`,
+    [
+      req.user?.id || null,
+      message,
+      result.reply
+    ]
+  );
+
+  res.json({
+    reply: result.reply,
+    products,
+    tip: products.length ? result.tip : undefined
+  });
+}));
+
+/* =========================================
+   10. XỬ LÝ LỖI
+========================================= */
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error);
+  }
+
+  if (error instanceof Err) {
+    return bad(res, error.message);
+  }
+
+  if (error.code === 'ER_DUP_ENTRY') {
+    return bad(res, 'Dữ liệu này đã tồn tại.', 409);
+  }
+
+  console.error('[SERVER ERROR]', error);
+
+  return bad(
+    res,
+    'Lỗi máy chủ, vui lòng thử lại sau.',
+    500
+  );
+});
+
+/* =========================================
+   11. TẠO TÀI KHOẢN ADMIN
+========================================= */
+
+async function ensureAdmin() {
+  const email = (
+    process.env.ADMIN_EMAIL || 'admin@beautyglow.vn'
+  ).trim().toLowerCase();
+
+  const [[existing]] = await db.query(
+    'SELECT id FROM users WHERE email = ?',
+    [email]
+  );
+
+  if (!existing) {
+    const password = process.env.ADMIN_PASSWORD;
+
+    if (!password) {
+      throw new Error(
+        'Chưa cấu hình ADMIN_PASSWORD trong file .env'
+      );
+    }
+
+    await db.query(
+      `INSERT INTO users
+       (name,email,password_hash,role,verified)
+       VALUES('Quản trị viên',?,?, 'admin',1)`,
+      [
+        email,
+        await bcrypt.hash(password, 10)
+      ]
+    );
+
+    console.log('Đã tạo tài khoản quản trị:', email);
+  } else {
+    console.log('Tài khoản Admin đã tồn tại:', email);
+  }
+}
+
+/* =========================================
+   12. KHỞI ĐỘNG SERVER
+========================================= */
+
+async function startServer() {
+  try {
+    console.log('Đang kiểm tra kết nối MySQL...');
+
+    const connection = await db.getConnection();
+
+    console.log('MySQL kết nối thành công!');
+    console.log('Database:', process.env.DB_NAME || 'beautyglow');
+
+    connection.release();
+
+    // Kiểm tra hoặc tạo tài khoản Admin
+    await ensureAdmin();
+
+    // Khởi động Express
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`BeautyGlow AI Backend đang chạy tại port ${PORT}`);
+    });
+
+  } catch (error) {
+    console.error('Không thể khởi động Backend:', error.message);
+
+    await db.end().catch(() => {});
+
+    process.exit(1);
+  }
+}
+
+startServer();
